@@ -16,12 +16,14 @@ package io.netty.handler.codec.http2;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.compression.Brotli;
 import io.netty.handler.codec.compression.BrotliDecoder;
+import io.netty.handler.codec.compression.DecompressionException;
 import io.netty.handler.codec.compression.Zstd;
 import io.netty.handler.codec.compression.ZstdDecoder;
 import io.netty.handler.codec.compression.ZlibCodecFactory;
@@ -166,29 +168,39 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
     protected EmbeddedChannel newContentDecompressor(final ChannelHandlerContext ctx, CharSequence contentEncoding)
             throws Http2Exception {
         if (GZIP.contentEqualsIgnoreCase(contentEncoding) || X_GZIP.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), ZlibCodecFactory.newZlibDecoder(ZlibWrapper.GZIP, maxAllocation));
+            return newDecompressorChannel(ctx, ZlibCodecFactory.newZlibDecoder(ZlibWrapper.GZIP, maxAllocation));
         }
         if (DEFLATE.contentEqualsIgnoreCase(contentEncoding) || X_DEFLATE.contentEqualsIgnoreCase(contentEncoding)) {
             final ZlibWrapper wrapper = strict ? ZlibWrapper.ZLIB : ZlibWrapper.ZLIB_OR_NONE;
             // To be strict, 'deflate' means ZLIB, but some servers were not implemented correctly.
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), ZlibCodecFactory.newZlibDecoder(wrapper, maxAllocation));
+            return newDecompressorChannel(ctx, ZlibCodecFactory.newZlibDecoder(wrapper, maxAllocation));
         }
         if (Brotli.isAvailable() && BR.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-              ctx.channel().config(), new BrotliDecoder());
+            return newDecompressorChannel(ctx, new BrotliDecoder());
         }
         if (SNAPPY.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), new SnappyFrameDecoder());
+            return newDecompressorChannel(ctx, new SnappyFrameDecoder());
         }
         if (Zstd.isAvailable() && ZSTD.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), new ZstdDecoder());
+            return newDecompressorChannel(ctx, new ZstdDecoder());
         }
         // 'identity' or unsupported
         return null;
+    }
+
+    /**
+     * Build the per-stream {@link EmbeddedChannel} that performs decompression. When {@code maxAllocation > 0} a
+     * {@link DecompressionLimiter} is appended after the decoder so the total decompressed output is bounded,
+     * mirroring the {@code maxAllocation} enforcement performed by the standalone compression decoders but kept
+     * self-contained within this module (so it does not depend on a patched {@code netty-codec}).
+     */
+    private EmbeddedChannel newDecompressorChannel(final ChannelHandlerContext ctx, ChannelHandler decoder) {
+        if (maxAllocation > 0) {
+            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
+                    ctx.channel().config(), decoder, new DecompressionLimiter(maxAllocation));
+        }
+        return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
+                ctx.channel().config(), decoder);
     }
 
     /**
@@ -260,6 +272,43 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
 
     Http2Decompressor decompressor(Http2Stream stream) {
         return stream == null ? null : (Http2Decompressor) stream.getProperty(propertyKey);
+    }
+
+    /**
+     * Inbound handler appended after the decoder inside the per-stream decompression {@link EmbeddedChannel}.
+     * It tracks the cumulative number of decompressed bytes and fails the stream once {@code maxAllocation} is
+     * exceeded. Because the decoders forward their output synchronously through the pipeline, the over-limit chunk and
+     * any output still produced afterwards are released here instead of reaching the listener, so the bound is
+     * enforced without modifying (or depending on a patched) {@code netty-codec}.
+     */
+    private static final class DecompressionLimiter extends ChannelInboundHandlerAdapter {
+        private final int maxAllocation;
+        private long totalOutputBytes;
+        private boolean limitExceeded;
+
+        DecompressionLimiter(int maxAllocation) {
+            this.maxAllocation = maxAllocation;
+        }
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+            if (msg instanceof ByteBuf) {
+                if (limitExceeded) {
+                    // The stream has already been failed. Drop any further output the decoder still produces for
+                    // the current input instead of raising (and logging) another exception per chunk.
+                    ((ByteBuf) msg).release();
+                    return;
+                }
+                totalOutputBytes += ((ByteBuf) msg).readableBytes();
+                if (totalOutputBytes > maxAllocation) {
+                    limitExceeded = true;
+                    ((ByteBuf) msg).release();
+                    throw new DecompressionException(
+                            "Decompression buffer has reached maximum size: " + maxAllocation);
+                }
+            }
+            ctx.fireChannelRead(msg);
+        }
     }
 
     /**

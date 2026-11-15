@@ -55,6 +55,7 @@ import static io.netty.handler.codec.http2.Http2CodecUtil.DEFAULT_PRIORITY_WEIGH
 import static io.netty.handler.codec.http2.Http2TestUtil.runInChannel;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.any;
@@ -291,6 +292,42 @@ public class DataCompressionHttp2Test {
     }
 
     @Test
+    public void brotliDecompressionBoundedByMaxAllocation() throws Exception {
+        // Regression test for CVE-2026-42587: a highly compressible body that decompresses far beyond the
+        // configured maxAllocation must not be delivered in full. The bound is enforced inside
+        // DelegatingDecompressorFrameListener itself, so it does not depend on a patched netty-codec.
+        final int maxAllocation = 64 * 1024;
+        final byte[] uncompressed = new byte[512 * 1024]; // zero-filled: compresses tiny, expands to 512 KiB
+        final int inputLength = uncompressed.length;
+        final ByteBuf data = Unpooled.wrappedBuffer(uncompressed);
+        bootstrapEnv(maxAllocation, maxAllocation);
+        try {
+            final Http2Headers headers = new DefaultHttp2Headers().method(POST).path(PATH)
+                    .set(HttpHeaderNames.CONTENT_ENCODING, HttpHeaderValues.BR);
+
+            runInChannel(clientChannel, new Http2Runnable() {
+                @Override
+                public void run() throws Http2Exception {
+                    clientEncoder.writeHeaders(ctxClient(), 3, headers, 0, false, newPromiseClient());
+                    clientEncoder.writeData(ctxClient(), 3, data.retain(), 0, true, newPromiseClient());
+                    clientHandler.flush(ctxClient());
+                }
+            });
+            // Wait for stream close (triggered by the decompression error closing the stream).
+            assertTrue(serverLatch.await(5, SECONDS));
+            serverOut.flush();
+            // Without the bound the full 512 KiB would reach the listener; with it the decompression is aborted
+            // once maxAllocation is crossed, so the delivered output stays bounded well below the bomb size.
+            assertTrue(serverOut.size() <= maxAllocation,
+                    "decompressed output " + serverOut.size() + " must be bounded by maxAllocation " + maxAllocation);
+            assertTrue(serverOut.size() < inputLength,
+                    "decompressed output " + serverOut.size() + " must be smaller than bomb size " + inputLength);
+        } finally {
+            data.release();
+        }
+    }
+
+    @Test
     public void zstdEncodingSingleEmptyMessage() throws Exception {
         final String text = "";
         final ByteBuf data = Unpooled.copiedBuffer(text.getBytes());
@@ -387,6 +424,99 @@ public class DataCompressionHttp2Test {
     }
 
     @Test
+    public void zstdDecompressionBoundedByMaxAllocation() throws Exception {
+        // Regression test for CVE-2026-42587: same decompression bomb as for brotli, but using zstd which also
+        // ignored the configured maxAllocation.
+        final int maxAllocation = 64 * 1024;
+        final byte[] uncompressed = new byte[512 * 1024]; // zero-filled: compresses tiny, expands to 512 KiB
+        final int inputLength = uncompressed.length;
+        final ByteBuf data = Unpooled.wrappedBuffer(uncompressed);
+        bootstrapEnv(maxAllocation, maxAllocation);
+        try {
+            final Http2Headers headers = new DefaultHttp2Headers().method(POST).path(PATH)
+                    .set(HttpHeaderNames.CONTENT_ENCODING, HttpHeaderValues.ZSTD);
+
+            runInChannel(clientChannel, new Http2Runnable() {
+                @Override
+                public void run() throws Http2Exception {
+                    clientEncoder.writeHeaders(ctxClient(), 3, headers, 0, false, newPromiseClient());
+                    clientEncoder.writeData(ctxClient(), 3, data.retain(), 0, true, newPromiseClient());
+                    clientHandler.flush(ctxClient());
+                }
+            });
+            // Wait for stream close (triggered by the decompression error closing the stream).
+            assertTrue(serverLatch.await(5, SECONDS));
+            serverOut.flush();
+            assertTrue(serverOut.size() <= maxAllocation,
+                    "decompressed output " + serverOut.size() + " must be bounded by maxAllocation " + maxAllocation);
+            assertTrue(serverOut.size() < inputLength,
+                    "decompressed output " + serverOut.size() + " must be smaller than bomb size " + inputLength);
+        } finally {
+            data.release();
+        }
+    }
+
+    @Test
+    public void snappyDecompressionBoundedByMaxAllocation() throws Exception {
+        // Regression test for CVE-2026-42587: same decompression bomb as for brotli, but using snappy which also
+        // ignored the configured maxAllocation.
+        final int maxAllocation = 64 * 1024;
+        final byte[] uncompressed = new byte[512 * 1024]; // zero-filled: compresses tiny, expands to 512 KiB
+        final int inputLength = uncompressed.length;
+        final ByteBuf data = Unpooled.wrappedBuffer(uncompressed);
+        bootstrapEnv(maxAllocation, maxAllocation);
+        try {
+            final Http2Headers headers = new DefaultHttp2Headers().method(POST).path(PATH)
+                    .set(HttpHeaderNames.CONTENT_ENCODING, HttpHeaderValues.SNAPPY);
+
+            runInChannel(clientChannel, new Http2Runnable() {
+                @Override
+                public void run() throws Http2Exception {
+                    clientEncoder.writeHeaders(ctxClient(), 3, headers, 0, false, newPromiseClient());
+                    clientEncoder.writeData(ctxClient(), 3, data.retain(), 0, true, newPromiseClient());
+                    clientHandler.flush(ctxClient());
+                }
+            });
+            // Wait for stream close (triggered by the decompression error closing the stream).
+            assertTrue(serverLatch.await(5, SECONDS));
+            serverOut.flush();
+            assertTrue(serverOut.size() <= maxAllocation,
+                    "decompressed output " + serverOut.size() + " must be bounded by maxAllocation " + maxAllocation);
+            assertTrue(serverOut.size() < inputLength,
+                    "decompressed output " + serverOut.size() + " must be smaller than bomb size " + inputLength);
+        } finally {
+            data.release();
+        }
+    }
+
+    @Test
+    public void brotliEncodingWithinMaxAllocation() throws Exception {
+        // A body that decompresses to exactly maxAllocation bytes must still be delivered in full when the bound is
+        // enabled.
+        final int maxAllocation = 64 * 1024;
+        final byte[] bytes = new byte[maxAllocation];
+        final ByteBuf data = Unpooled.wrappedBuffer(bytes);
+        bootstrapEnv(maxAllocation, maxAllocation);
+        try {
+            final Http2Headers headers = new DefaultHttp2Headers().method(POST).path(PATH)
+                    .set(HttpHeaderNames.CONTENT_ENCODING, HttpHeaderValues.BR);
+
+            runInChannel(clientChannel, new Http2Runnable() {
+                @Override
+                public void run() throws Http2Exception {
+                    clientEncoder.writeHeaders(ctxClient(), 3, headers, 0, false, newPromiseClient());
+                    clientEncoder.writeData(ctxClient(), 3, data.retain(), 0, true, newPromiseClient());
+                    clientHandler.flush(ctxClient());
+                }
+            });
+            awaitServer();
+            assertArrayEquals(bytes, serverOut.toByteArray());
+        } finally {
+            data.release();
+        }
+    }
+
+    @Test
     public void deflateEncodingWriteLargeMessage() throws Exception {
         final int BUFFER_SIZE = 1 << 12;
         final byte[] bytes = new byte[BUFFER_SIZE];
@@ -414,6 +544,10 @@ public class DataCompressionHttp2Test {
     }
 
     private void bootstrapEnv(int serverOutSize) throws Exception {
+        bootstrapEnv(serverOutSize, 0);
+    }
+
+    private void bootstrapEnv(int serverOutSize, final int maxAllocation) throws Exception {
         final CountDownLatch prefaceWrittenLatch = new CountDownLatch(1);
         serverOut = new ByteArrayOutputStream(serverOutSize);
         serverLatch = new CountDownLatch(1);
@@ -441,7 +575,11 @@ public class DataCompressionHttp2Test {
                 buf.readBytes(serverOut, buf.readableBytes());
 
                 if (in.getArgument(4)) {
-                    serverConnection.stream((Integer) in.getArgument(1)).close();
+                    // The stream may already be gone if it was reset because decompression failed.
+                    Http2Stream stream = serverConnection.stream((Integer) in.getArgument(1));
+                    if (stream != null) {
+                        stream.close();
+                    }
                 }
                 return processedBytes;
             }
@@ -466,7 +604,8 @@ public class DataCompressionHttp2Test {
                 Http2ConnectionDecoder decoder =
                         new DefaultHttp2ConnectionDecoder(serverConnection, encoder, new DefaultHttp2FrameReader());
                 Http2ConnectionHandler connectionHandler = new Http2ConnectionHandlerBuilder()
-                        .frameListener(new DelegatingDecompressorFrameListener(serverConnection, serverListener, 0))
+                        .frameListener(new DelegatingDecompressorFrameListener(
+                                serverConnection, serverListener, true, maxAllocation))
                         .codec(decoder, encoder).build();
                 p.addLast(connectionHandler);
                 serverChannelLatch.countDown();
